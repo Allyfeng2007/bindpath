@@ -26,6 +26,12 @@ NMS_IOU      = 0.50
 # 加载两个 YOLOv8 模型
 # ========================
 model_general = YOLO(GENERAL_WEIGHTS)
+# best.pt 可能尚未训练好或路径不同，这里做容错
+try:
+    model_blind = YOLO(BLIND_WEIGHTS)
+except Exception as e:
+    print(f'[WARN] 加载盲道模型失败：{e}\n将仅使用通用模型。')
+    model_blind = None
 
 # 线程池（并行两次推理；单GPU下主要重叠CPU预处理，GPU会串行，仍然可用）
 executor = ThreadPoolExecutor(max_workers=2)
@@ -112,11 +118,8 @@ def predict():
         if not image_data:
             return jsonify({'error': '未提供图片数据'}), 400
 
-        if ',' in image_data:
-            _, data = image_data.split(',', 1)
-        else:
-            data = image_data
-
+        # 1) 解析 base64
+        data = image_data.split(',', 1)[-1] if ',' in image_data else image_data
         img_bytes = base64.b64decode(data)
         img_np = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
@@ -125,43 +128,71 @@ def predict():
 
         h, w = img.shape[:2]
 
-        # ========================
-        # 并行两次推理
-        # ========================
-        futures = []
-        futures.append(executor.submit(run_one_model, model_general, img, GENERAL_CONF, NMS_IOU))
+        # 2) 先跑“你原来能工作的 yolov8n.pt 写法”，不要改任何默认阈值
+        #    ——这一步应该能恢复你“红绿灯检测OK”的旧行为
+        results_g = model_general(img, verbose=False)[0]  # 关键：沿用旧写法
+        dets = []
+        if results_g.boxes is not None and len(results_g.boxes) > 0:
+            names_g = results_g.names  # COCO 的 80 类名
+            for b in results_g.boxes:
+                cls_id = int(b.cls[0])
+                cls_name = names_g[cls_id]
+                x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "general"})
+
+        # 3) 再跑你的 best.pt（如果加载成功）
         if model_blind is not None:
-            futures.append(executor.submit(run_one_model, model_blind,   img, BLIND_CONF,   NMS_IOU))
+            # 为避免阈值过高导致“明明能检却被过滤”，这里也先用默认阈值（与旧版一致）
+            results_b = model_blind(img, verbose=False)[0]
+            if results_b.boxes is not None and len(results_b.boxes) > 0:
+                names_b = results_b.names  # 一般是 ['blind_path']
+                for b in results_b.boxes:
+                    cls_id = int(b.cls[0])
+                    cls_name = names_b[cls_id]
+                    x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "blind"})
 
-        dets_all = []
-        results_meta = []
-        for f in futures:
-            dets, r = f.result()
-            dets_all.append(dets)
-            results_meta.append(r)  # 如需调试：r.save_dir / r.speed 等
+        # 4) 如果两边都没检到，做一次“降阈值重试”（只重试一次，避免反复）
+        if len(dets) == 0:
+            # 降 conf + 提大 imgsz；这两步对红绿灯/细长目标很有效
+            results_g2 = model_general(img, conf=0.15, imgsz=960, iou=0.5, verbose=False)[0]
+            if results_g2.boxes is not None and len(results_g2.boxes) > 0:
+                names_g = results_g2.names
+                for b in results_g2.boxes:
+                    cls_id = int(b.cls[0])
+                    cls_name = names_g[cls_id]
+                    x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "general"})
 
-        # 合并结果：通用80类 + 盲道专用
-        merged = []
-        for dets in dets_all:
-            merged.extend(dets)
+            if model_blind is not None:
+                results_b2 = model_blind(img, conf=0.35, imgsz=960, iou=0.5, verbose=False)[0]
+                if results_b2.boxes is not None and len(results_b2.boxes) > 0:
+                    names_b = results_b2.names
+                    for b in results_b2.boxes:
+                        cls_id = int(b.cls[0])
+                        cls_name = names_b[cls_id]
+                        x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                        dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "blind"})
 
-        # 给交通灯补充颜色
-        merged = enrich_traffic_light_color(img, merged)
+        # 5) 给 traffic light 加颜色（不影响“是否检测到”的判断）
+        dets = enrich_traffic_light_color(img, dets)
 
-        text = generate_alert_text(merged, img_w=w)
+        # 6) 生成播报
+        text = generate_alert_text(dets, img_w=w)
 
         return jsonify({
             'result': text,
-            'detections': merged,
+            'detections': dets,
             'meta': {
-                'general_conf': GENERAL_CONF,
-                'blind_conf': BLIND_CONF if model_blind else None,
-                # 可选：你也可以把 results_meta 里的 speed、orig_shape 等放出来
+                'general_boxes': int(len([d for d in dets if d["source"] == "general"])),
+                'blind_boxes':   int(len([d for d in dets if d["source"] == "blind"])),
+                'blind_model_loaded': model_blind is not None
             }
         })
 
     except Exception as e:
         return jsonify({'error': f'处理失败: {e}'}), 500
+
 
 
 @app.route('/tts', methods=['POST'])
@@ -209,4 +240,4 @@ def routes():
     return jsonify(sorted([f"{sorted(r.methods)} {r.rule}" for r in app.url_map.iter_rules()]))
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80, debug=False)
+    app.run(host='0.0.0.0', port=80, debug=True)
