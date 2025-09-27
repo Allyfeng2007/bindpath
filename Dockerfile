@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua
 
 COPY app.py .
 COPY yolov8n.pt .
+COPY best.pt .
 
 EXPOSE 80
 CMD ["gunicorn", "-b", "0.0.0.0:80", "-w", "2", "-k", "gthread", "--threads", "4", "--timeout", "120", "app:app"]
