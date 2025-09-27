@@ -1,4 +1,4 @@
-# app.py
+# app.py (fixed thresholds + blind_path geometric filter)
 from flask import Flask, request, jsonify
 import cv2
 import numpy as np
@@ -7,6 +7,7 @@ import base64, os, json
 from concurrent.futures import ThreadPoolExecutor
 
 # ==== 腾讯云 TTS ====
+# 说明：安装包名为 tencentcloud-sdk-python，导入名为 tencentcloud
 from tencentcloud.common import credential
 from tencentcloud.tts.v20190823 import tts_client, models
 
@@ -16,7 +17,7 @@ app = Flask(__name__)
 # 配置：两套模型与阈值
 # ========================
 GENERAL_WEIGHTS = './yolov8n.pt'  # 通用80类
-BLIND_WEIGHTS   = './best.pt'  # 你的盲道专用权重
+BLIND_WEIGHTS   = './best.pt'     # 你的盲道专用权重
 
 GENERAL_CONF = 0.25   # 通用模型阈值：更稳则调高
 BLIND_CONF   = 0.58   # 盲道模型阈值：取F1最佳点（你之前曲线≈0.58）
@@ -73,21 +74,6 @@ def generate_alert_text(dets, img_w):
     return "，".join(alert) + "。" if alert else "未检测到目标"
 
 
-def run_one_model(model, img, conf, iou):
-    """对单个模型推理，并转成 dets 结构"""
-    r = model.predict(source=img, conf=conf, iou=iou, verbose=False)[0]
-    out = []
-    if r.boxes is not None and len(r.boxes) > 0:
-        names = r.names
-        for b in r.boxes:
-            cls_id = int(b.cls[0])
-            cls_name = names[cls_id]
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            det = {"class": cls_name, "box": [x1, y1, x2, y2]}
-            out.append(det)
-    return out, r
-
-
 def enrich_traffic_light_color(img, dets):
     """给 traffic light 加颜色标签"""
     for det in dets:
@@ -110,6 +96,37 @@ def enrich_traffic_light_color(img, dets):
     return dets
 
 
+def filter_blind_path(dets, img_h, img_w):
+    """对盲道候选框做几何与置信度过滤，降低假阳性"""
+    kept = []
+    for d in dets:
+        if d["class"] != "blind_path":
+            kept.append(d)
+            continue
+
+        x1, y1, x2, y2 = d["box"]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        area = w * h
+        area_ratio = area / float(img_h * img_w)
+        cy = (y1 + y2) / 2.0
+        aspect = w / float(h)
+        conf = float(d.get("conf", 0.0))
+
+        # 规则可按数据分布调参
+        if cy < img_h * 0.45:       # 一般位于下半部分
+            continue
+        if area_ratio < 0.002:      # 至少覆盖 0.2% 的画面
+            continue
+        if aspect < 0.2 or aspect > 8.0:  # 过细或过扁的排除
+            continue
+        if conf < 0.55:             # 兜底置信度
+            continue
+
+        kept.append(d)
+    return kept
+
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -128,54 +145,62 @@ def predict():
 
         h, w = img.shape[:2]
 
-        # 2) 先跑“你原来能工作的 yolov8n.pt 写法”，不要改任何默认阈值
-        #    ——这一步应该能恢复你“红绿灯检测OK”的旧行为
-        results_g = model_general(img, verbose=False)[0]  # 关键：沿用旧写法
+        # 2) 通用模型（显式使用阈值）
         dets = []
+        results_g = model_general(img, conf=GENERAL_CONF, iou=NMS_IOU, verbose=False)[0]
         if results_g.boxes is not None and len(results_g.boxes) > 0:
-            names_g = results_g.names  # COCO 的 80 类名
+            names_g = results_g.names
             for b in results_g.boxes:
                 cls_id = int(b.cls[0])
                 cls_name = names_g[cls_id]
                 x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "general"})
+                score = float(b.conf[0])
+                dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "conf": score, "source": "general"})
 
-        # 3) 再跑你的 best.pt（如果加载成功）
+        # 3) 盲道模型（严格阈值）
         if model_blind is not None:
-            # 为避免阈值过高导致“明明能检却被过滤”，这里也先用默认阈值（与旧版一致）
-            results_b = model_blind(img, verbose=False)[0]
+            results_b = model_blind(img, conf=BLIND_CONF, iou=NMS_IOU, verbose=False)[0]
             if results_b.boxes is not None and len(results_b.boxes) > 0:
-                names_b = results_b.names  # 一般是 ['blind_path']
+                names_b = results_b.names
                 for b in results_b.boxes:
                     cls_id = int(b.cls[0])
                     cls_name = names_b[cls_id]
                     x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "blind"})
+                    score = float(b.conf[0])
+                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "conf": score, "source": "blind"})
 
-        # 4) 如果两边都没检到，做一次“降阈值重试”（只重试一次，避免反复）
+        # 4) “降阈值重试”：仅放宽分辨率，不降低盲道置信度
         if len(dets) == 0:
-            # 降 conf + 提大 imgsz；这两步对红绿灯/细长目标很有效
-            results_g2 = model_general(img, conf=0.15, imgsz=960, iou=0.5, verbose=False)[0]
+            results_g2 = model_general(img, conf=0.15, imgsz=960, iou=NMS_IOU, verbose=False)[0]
             if results_g2.boxes is not None and len(results_g2.boxes) > 0:
                 names_g = results_g2.names
                 for b in results_g2.boxes:
                     cls_id = int(b.cls[0])
                     cls_name = names_g[cls_id]
                     x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "general"})
-
+                    score = float(b.conf[0])
+                    dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "conf": score, "source": "general"})
             if model_blind is not None:
-                results_b2 = model_blind(img, conf=0.35, imgsz=960, iou=0.5, verbose=False)[0]
+                results_b2 = model_blind(img, conf=max(0.60, BLIND_CONF), imgsz=960, iou=NMS_IOU, verbose=False)[0]
                 if results_b2.boxes is not None and len(results_b2.boxes) > 0:
                     names_b = results_b2.names
                     for b in results_b2.boxes:
                         cls_id = int(b.cls[0])
                         cls_name = names_b[cls_id]
                         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-                        dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "source": "blind"})
+                        score = float(b.conf[0])
+                        dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "conf": score, "source": "blind"})
 
-        # 5) 给 traffic light 加颜色（不影响“是否检测到”的判断）
+        # 5) 交通灯加颜色
         dets = enrich_traffic_light_color(img, dets)
+
+        # 5.5) 对盲道做几何/置信度过滤
+        dets = filter_blind_path(dets, h, w)
+
+        # 调试输出（可选）
+        blind = [d for d in dets if d["class"] == "blind_path"]
+        if blind:
+            print(f"[BLIND] count={len(blind)}, mean_conf={np.mean([d['conf'] for d in blind]):.3f}")
 
         # 6) 生成播报
         text = generate_alert_text(dets, img_w=w)
@@ -184,15 +209,14 @@ def predict():
             'result': text,
             'detections': dets,
             'meta': {
-                'general_boxes': int(len([d for d in dets if d["source"] == "general"])),
-                'blind_boxes':   int(len([d for d in dets if d["source"] == "blind"])),
+                'general_boxes': int(len([d for d in dets if d.get("source") == "general"])),
+                'blind_boxes':   int(len([d for d in dets if d.get("source") == "blind"])),
                 'blind_model_loaded': model_blind is not None
             }
         })
 
     except Exception as e:
         return jsonify({'error': f'处理失败: {e}'}), 500
-
 
 
 @app.route('/tts', methods=['POST'])
@@ -238,6 +262,7 @@ def health():
 @app.route('/routes', methods=['GET'])
 def routes():
     return jsonify(sorted([f"{sorted(r.methods)} {r.rule}" for r in app.url_map.iter_rules()]))
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80, debug=True)
