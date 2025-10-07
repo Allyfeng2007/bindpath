@@ -20,7 +20,7 @@ GENERAL_WEIGHTS = './yolov8n.pt'  # 通用80类
 BLIND_WEIGHTS   = './best.pt'     # 你的盲道专用权重
 
 GENERAL_CONF = 0.25   # 通用模型阈值：更稳则调高
-BLIND_CONF   = 0.58   # 盲道模型阈值：取F1最佳点（你之前曲线≈0.58）
+BLIND_CONF   = 0.65   # 盲道模型阈值：取F1最佳点（你之前曲线≈0.58）
 NMS_IOU      = 0.50
 
 # ========================
@@ -266,3 +266,4 @@ def routes():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80, debug=True)
+
