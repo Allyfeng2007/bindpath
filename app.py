@@ -49,30 +49,90 @@ def safe_crop(img, x1, y1, x2, y2):
     return img[yy1:yy2, xx1:xx2]
 
 
-def generate_alert_text(dets, img_w):
-    alert = []
-    for det in dets:
-        cls_name = det["class"]
-        x1, y1, x2, y2 = det["box"]
-        if cls_name == "traffic light":
-            color = det.get("color")
-            if color in ("红灯", "绿灯", "黄灯"):
-                alert.append(f"前方{color}")
-            else:
-                alert.append("前方交通灯")
-        elif cls_name == "blind_path":
-            alert.append("前方盲道")
-        else:
+def generate_alert_text(dets, img_w, simplify=True):
+    """
+    播报精简策略：
+    1) 若存在 on_blind=True 的自行车：直接播报“盲道上有自行车，请注意避让。”
+    2) 否则：
+       - 若“多种类型障碍/多个障碍同时出现”，统一播报“前方有障碍物”
+       - 同时保留对“前方盲道”与“交通灯颜色”的简短提示（如果存在）
+       - 若只有一种障碍且数量不多，按原来规则播报方位+类别
+    """
+    # 一些中文名映射
+    cname_zh = {
+        'person': '行人', 'bicycle': '自行车', 'car': '汽车',
+        'motorbike': '摩托车', 'bus': '公交车', 'truck': '卡车'
+    }
+    # 定义“障碍”类（不含盲道、交通灯；盲道上的自行车单独处理）
+    OBSTACLE_CLASSES = {'person', 'bicycle', 'car', 'motorbike', 'bus', 'truck'}
+
+    text_parts = []
+
+    # ---- 1) 最高优先级：盲道上的自行车 ----
+    bikes_on_blind = [d for d in dets if d['class'] == 'bicycle' and d.get('on_blind') is True]
+    if bikes_on_blind:
+        return "盲道上有自行车，请注意避让。"
+
+    # ---- 2) 盲道、交通灯（作为环境提示）----
+    blinds = [d for d in dets if d['class'] == 'blind_path']
+
+    tls = [d for d in dets if d['class'] == 'traffic light']
+    tl_text = None
+    if tls:
+        # 只保留一句交通灯颜色提示（若能判色）
+        color = tls[0].get("color")
+        tl_text = f"前方{color}" if color in ("红灯", "绿灯", "黄灯") else "前方交通灯"
+
+    # ---- 3) 其他障碍（不含盲道与交通灯；且排除已判定在盲道上的自行车）----
+    obstacles = []
+    for d in dets:
+        if d['class'] in OBSTACLE_CLASSES:
+            # 已经作为“盲道上有自行车”处理过的跳过（虽然上面已return，这里做个稳妥保护）
+            if d['class'] == 'bicycle' and d.get('on_blind') is True:
+                continue
+            obstacles.append(d)
+
+    obstacle_types = set(d['class'] for d in obstacles)
+
+    # ---- 精简逻辑：多种类型/多个障碍 -> 统一播报“前方有障碍物” ----
+    need_summarize = simplify and (len(obstacles) >= 2 and len(obstacle_types) >= 2)
+
+    if need_summarize:
+        # 环境提示放前面（如果有）
+        if blinds:
+            text_parts.append("前方盲道")
+        if tl_text:
+            text_parts.append(tl_text)
+        # 障碍统一一句
+        text_parts.append("前方有障碍物")
+        # 去重拼接
+        text_parts = list(dict.fromkeys(text_parts))
+        return "，".join(text_parts) + "。"
+
+    # ---- 否则：只有一种障碍或数量不多 -> 适度细化（保持简洁）----
+    if blinds:
+        text_parts.append("前方盲道")
+    if tl_text:
+        text_parts.append(tl_text)
+
+    # 对剩余障碍，若只有一个，就播报其方位+类别；若多个但同类，也只播报一句汇总
+    if obstacles:
+        if len(obstacles) == 1:
+            d = obstacles[0]
+            x1, y1, x2, y2 = d["box"]
             cx = (x1 + x2) / 2
             pos = "左侧" if cx < img_w * 0.3 else ("右侧" if cx > img_w * 0.7 else "前方")
-            cname_zh = {
-                'person': '行人', 'bicycle': '自行车', 'car': '汽车',
-                'motorbike': '摩托车', 'bus': '公交车', 'truck': '卡车'
-            }.get(cls_name, "障碍物")
-            alert.append(f"{pos}有{cname_zh}")
-    alert = list(dict.fromkeys(alert))
-    return "，".join(alert) + "。" if alert else "未检测到目标"
+            zh = cname_zh.get(d['class'], "障碍物")
+            text_parts.append(f"{pos}有{zh}")
+        else:
+            # 多个但同一类：仍然统一成一句“前方有<类名>”，避免连珠炮
+            the_class = next(iter(obstacle_types))
+            zh = cname_zh.get(the_class, "障碍物")
+            text_parts.append(f"前方有{zh}")
 
+    # 输出
+    text_parts = list(dict.fromkeys(text_parts))
+    return "，".join(text_parts) + "。" if text_parts else "未检测到目标。"
 
 def enrich_traffic_light_color(img, dets):
     """给 traffic light 加颜色标签"""
@@ -266,4 +326,5 @@ def routes():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80, debug=True)
+
 
