@@ -1,4 +1,3 @@
-# app.py (fixed thresholds + blind_path geometric filter)
 from flask import Flask, request, jsonify
 import cv2
 import numpy as np
@@ -17,10 +16,10 @@ app = Flask(__name__)
 # 配置：两套模型与阈值
 # ========================
 GENERAL_WEIGHTS = './yolov8n.pt'  # 通用80类
-BLIND_WEIGHTS   = './best.pt'     # 你的盲道专用权重
+BLIND_WEIGHTS   = './best.pt'     # 你的盲道专用权重（含 blind_path, bicycle）
 
 GENERAL_CONF = 0.25   # 通用模型阈值：更稳则调高
-BLIND_CONF   = 0.65   # 盲道模型阈值：取F1最佳点（你之前曲线≈0.58）
+BLIND_CONF   = 0.65   # 盲道模型阈值：取F1最佳点
 NMS_IOU      = 0.50
 
 # ========================
@@ -37,7 +36,9 @@ except Exception as e:
 # 线程池（并行两次推理；单GPU下主要重叠CPU预处理，GPU会串行，仍然可用）
 executor = ThreadPoolExecutor(max_workers=2)
 
-
+# ========================
+# 辅助函数
+# ========================
 def safe_crop(img, x1, y1, x2, y2):
     h, w = img.shape[:2]
     xx1 = max(0, min(w - 1, x1))
@@ -48,6 +49,119 @@ def safe_crop(img, x1, y1, x2, y2):
         return None
     return img[yy1:yy2, xx1:xx2]
 
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+def inter_area(boxA, boxB):
+    ax1, ay1, ax2, ay2 = boxA
+    bx1, by1, bx2, by2 = boxB
+    xi1, yi1 = max(ax1, bx1), max(ay1, by1)
+    xi2, yi2 = min(ax2, bx2), min(ay2, by2)
+    return max(0, xi2 - xi1) * max(0, yi2 - yi1)
+
+def iou(boxA, boxB):
+    ia = inter_area(boxA, boxB)
+    ua = box_area(boxA) + box_area(boxB) - ia + 1e-9
+    return ia / ua
+
+def ioa_inter_over_A(boxA, boxB):
+    """交叠面积 / A面积，用于判断“自行车是否在盲道上”"""
+    ia = inter_area(boxA, boxB)
+    aa = box_area(boxA) + 1e-9
+    return ia / aa
+
+def merge_dets_by_class(dets, iou_thr=0.5):
+    """
+    简易类内合并：同类别框若 IoU > 阈值，则保留
+    (1) 置信度更高的；如置信度相近，(2) 优先 source='blind'
+    """
+    out = []
+    dets_sorted = sorted(dets, key=lambda d: (d.get('class',''), -d.get('conf',0.0), d.get('source')!='blind'))
+    for d in dets_sorted:
+        keep = True
+        for i, kept in enumerate(out):
+            if kept['class'] != d['class']:
+                continue
+            if iou(kept['box'], d['box']) > iou_thr:
+                # 选择更优
+                prefer_d = d if (d['conf'] > kept['conf'] + 1e-6 or
+                                 (abs(d['conf'] - kept['conf']) <= 1e-6 and d.get('source') == 'blind')) else kept
+                out[i] = prefer_d
+                keep = False
+                break
+        if keep:
+            out.append(d)
+    return out
+
+def enrich_traffic_light_color(img, dets):
+    """给 traffic light 加颜色标签"""
+    for det in dets:
+        if det["class"] == "traffic light":
+            x1, y1, x2, y2 = det["box"]
+            roi = safe_crop(img, x1, y1, x2, y2)
+            if roi is not None and roi.size > 0:
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                mask_red = cv2.inRange(hsv, (0, 100, 100), (10, 255, 255)) | \
+                           cv2.inRange(hsv, (160, 100, 100), (180, 255, 255))
+                mask_green = cv2.inRange(hsv, (50, 100, 100), (90, 255, 255))
+                red_count = int(cv2.countNonZero(mask_red))
+                green_count = int(cv2.countNonZero(mask_green))
+                if red_count > 50 and red_count > green_count:
+                    det["color"] = "红灯"
+                elif green_count > 50 and green_count > red_count:
+                    det["color"] = "绿灯"
+                else:
+                    det["color"] = "黄灯"
+    return dets
+
+def filter_blind_path(dets, img_h, img_w):
+    """对盲道候选框做几何与置信度过滤，降低假阳性"""
+    kept = []
+    for d in dets:
+        if d["class"] != "blind_path":
+            kept.append(d)
+            continue
+
+        x1, y1, x2, y2 = d["box"]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        area = w * h
+        area_ratio = area / float(img_h * img_w)
+        cy = (y1 + y2) / 2.0
+        aspect = w / float(h)
+        conf = float(d.get("conf", 0.0))
+
+        # 规则可按数据分布调参
+        if cy < img_h * 0.45:       # 一般位于下半部分
+            continue
+        if area_ratio < 0.002:      # 至少覆盖 0.2% 的画面
+            continue
+        if aspect < 0.2 or aspect > 8.0:  # 过细或过扁的排除
+            continue
+        if conf < 0.55:             # 兜底置信度
+            continue
+
+        kept.append(d)
+    return kept
+
+def tag_bicycle_on_blind(dets, overlap_thr=0.20):
+    """
+    为自行车增加 on_blind: True/False 标记
+    规则：与任意 blind_path 的相交面积占“自行车面积”的比例 ≥ overlap_thr
+    """
+    blinds = [d for d in dets if d['class'] == 'blind_path']
+    bikes  = [d for d in dets if d['class'] == 'bicycle']
+
+    for b in bikes:
+        b_box = b['box']
+        on_blind = False
+        for bp in blinds:
+            if ioa_inter_over_A(b_box, bp['box']) >= overlap_thr:
+                on_blind = True
+                break
+        b['on_blind'] = on_blind
+    return dets
 
 def generate_alert_text(dets, img_w, simplify=True):
     """
@@ -134,59 +248,10 @@ def generate_alert_text(dets, img_w, simplify=True):
     text_parts = list(dict.fromkeys(text_parts))
     return "，".join(text_parts) + "。" if text_parts else "未检测到目标。"
 
-def enrich_traffic_light_color(img, dets):
-    """给 traffic light 加颜色标签"""
-    for det in dets:
-        if det["class"] == "traffic light":
-            x1, y1, x2, y2 = det["box"]
-            roi = safe_crop(img, x1, y1, x2, y2)
-            if roi is not None and roi.size > 0:
-                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                mask_red = cv2.inRange(hsv, (0, 100, 100), (10, 255, 255)) | \
-                           cv2.inRange(hsv, (160, 100, 100), (180, 255, 255))
-                mask_green = cv2.inRange(hsv, (50, 100, 100), (90, 255, 255))
-                red_count = int(cv2.countNonZero(mask_red))
-                green_count = int(cv2.countNonZero(mask_green))
-                if red_count > 50 and red_count > green_count:
-                    det["color"] = "红灯"
-                elif green_count > 50 and green_count > red_count:
-                    det["color"] = "绿灯"
-                else:
-                    det["color"] = "黄灯"
-    return dets
 
-
-def filter_blind_path(dets, img_h, img_w):
-    """对盲道候选框做几何与置信度过滤，降低假阳性"""
-    kept = []
-    for d in dets:
-        if d["class"] != "blind_path":
-            kept.append(d)
-            continue
-
-        x1, y1, x2, y2 = d["box"]
-        w = max(1, x2 - x1)
-        h = max(1, y2 - y1)
-        area = w * h
-        area_ratio = area / float(img_h * img_w)
-        cy = (y1 + y2) / 2.0
-        aspect = w / float(h)
-        conf = float(d.get("conf", 0.0))
-
-        # 规则可按数据分布调参
-        if cy < img_h * 0.45:       # 一般位于下半部分
-            continue
-        if area_ratio < 0.002:      # 至少覆盖 0.2% 的画面
-            continue
-        if aspect < 0.2 or aspect > 8.0:  # 过细或过扁的排除
-            continue
-        if conf < 0.55:             # 兜底置信度
-            continue
-
-        kept.append(d)
-    return kept
-
-
+# ========================
+# 推理与API
+# ========================
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -251,18 +316,26 @@ def predict():
                         score = float(b.conf[0])
                         dets.append({"class": cls_name, "box": [x1, y1, x2, y2], "conf": score, "source": "blind"})
 
-        # 5) 交通灯加颜色
-        dets = enrich_traffic_light_color(img, dets)
+        # 5) 合并同类重复框，降低重复播报
+        dets = merge_dets_by_class(dets, iou_thr=0.5)
 
-        # 5.5) 对盲道做几何/置信度过滤
+        # 6) 交通灯加颜色 & 盲道几何过滤
+        dets = enrich_traffic_light_color(img, dets)
         dets = filter_blind_path(dets, h, w)
+
+        # 7) 标记“自行车是否在盲道上”
+        dets = tag_bicycle_on_blind(dets, overlap_thr=0.20)
 
         # 调试输出（可选）
         blind = [d for d in dets if d["class"] == "blind_path"]
         if blind:
             print(f"[BLIND] count={len(blind)}, mean_conf={np.mean([d['conf'] for d in blind]):.3f}")
+        bikes = [d for d in dets if d["class"] == "bicycle"]
+        if bikes:
+            on_blind_cnt = sum(1 for b in bikes if b.get('on_blind'))
+            print(f"[BIKE] count={len(bikes)}, on_blind={on_blind_cnt}")
 
-        # 6) 生成播报
+        # 8) 生成播报
         text = generate_alert_text(dets, img_w=w)
 
         return jsonify({
@@ -278,7 +351,7 @@ def predict():
     except Exception as e:
         return jsonify({'error': f'处理失败: {e}'}), 500
 
-
+# ====== TTS 与健康检查 ======
 @app.route('/tts', methods=['POST'])
 def tts():
     try:
@@ -313,18 +386,18 @@ def tts():
     except Exception as e:
         return jsonify({'error': f'TTS失败: {e}'}), 500
 
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'healthy', 'service': 'yolo-detection'})
-
 
 @app.route('/routes', methods=['GET'])
 def routes():
     return jsonify(sorted([f"{sorted(r.methods)} {r.rule}" for r in app.url_map.iter_rules()]))
 
-
 if __name__ == '__main__':
+    # 生产建议用 0.0.0.0:80 由容器/网关暴露；本地可改成 5000
     app.run(host='0.0.0.0', port=80, debug=True)
+
+
 
 
